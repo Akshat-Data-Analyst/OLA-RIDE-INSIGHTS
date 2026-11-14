@@ -13,6 +13,7 @@ Run locally :  streamlit run app.py
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -21,24 +22,135 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Ola Ride Insights", page_icon="🚖", layout="wide")
 
 BASE_DIR = Path(__file__).parent
-CSV_PATH = BASE_DIR / "ola_cleaned.csv.gz"
-SQL_FILE = BASE_DIR / "02_sql_queries.sql"
+DATA_DIR = BASE_DIR / "data"
 YELLOW, BLACK = "#C6D600", "#111111"
 PALETTE = px.colors.qualitative.Safe
+
+# --------------------------------------------------------------------------
+# SQL queries (project questions)
+# --------------------------------------------------------------------------
+QUERIES = {
+    'Q1. Retrieve all successful bookings': """SELECT *
+FROM ola_rides
+WHERE Booking_Status = 'Success'""",
+    'Q2. Average ride distance for each vehicle type': """SELECT Vehicle_Type,
+       ROUND(AVG(Ride_Distance), 2) AS Avg_Ride_Distance
+FROM ola_rides
+WHERE Booking_Status = 'Success'          -- cancelled rides have 0 km
+GROUP BY Vehicle_Type
+ORDER BY Avg_Ride_Distance DESC""",
+    'Q3. Total number of cancelled rides by customers': """SELECT COUNT(*) AS Cancelled_By_Customers
+FROM ola_rides
+WHERE Booking_Status = 'Canceled by Customer'""",
+    'Q4. Top 5 customers who booked the highest number of rides': """SELECT Customer_ID,
+       COUNT(Booking_ID) AS Total_Rides
+FROM ola_rides
+GROUP BY Customer_ID
+ORDER BY Total_Rides DESC, Customer_ID
+LIMIT 5""",
+    'Q5. Rides cancelled by drivers due to personal & car related issues': """SELECT COUNT(*) AS Driver_Cancels_Personal_Car_Issue
+FROM ola_rides
+WHERE Canceled_Rides_by_Driver = 'Personal & Car related issue'""",
+    'Q6. Max and min driver ratings for Prime Sedan bookings': """SELECT MAX(Driver_Ratings) AS Max_Driver_Rating,
+       MIN(Driver_Ratings) AS Min_Driver_Rating
+FROM ola_rides
+WHERE Vehicle_Type = 'Prime Sedan'
+  AND Driver_Ratings IS NOT NULL""",
+    'Q7. All rides where payment was made using UPI': """SELECT *
+FROM ola_rides
+WHERE Payment_Method = 'UPI'""",
+    'Q8. Average customer rating per vehicle type': """SELECT Vehicle_Type,
+       ROUND(AVG(Customer_Rating), 2) AS Avg_Customer_Rating
+FROM ola_rides
+WHERE Customer_Rating IS NOT NULL
+GROUP BY Vehicle_Type
+ORDER BY Avg_Customer_Rating DESC""",
+    'Q9. Total booking value of rides completed successfully': """SELECT SUM(Booking_Value) AS Total_Booking_Value
+FROM ola_rides
+WHERE Booking_Status = 'Success'""",
+    'Q10. All incomplete rides along with the reason': """SELECT Booking_ID, Customer_ID, Vehicle_Type, Pickup_Location, Drop_Location,
+       Incomplete_Rides, Incomplete_Rides_Reason
+FROM ola_rides
+WHERE Incomplete_Rides = 'Yes'""",
+}
+
+
+# --------------------------------------------------------------------------
+# Cleaning
+# --------------------------------------------------------------------------
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # 1. Standardise column names (the 'Vehicle Images' column has a space)
+    df.columns = [c.strip().replace(" ", "_") for c in df.columns]
+
+    # 2. Remove exact duplicate bookings (none expected, but be safe)
+    df = df.drop_duplicates(subset="Booking_ID")
+
+    # 3. Dates / times.  'Date' already carries a clock time, so split it out.
+    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+    df["Time"] = df["Time"].astype(str)                       # HH:MM:SS text
+    df["Hour"] = pd.to_datetime(df["Time"], format="%H:%M:%S").dt.hour
+    df["Day_Name"] = df["Date"].dt.day_name()
+    df["Week"] = df["Date"].dt.isocalendar().week.astype(int)
+
+    # 4. Trim / standardise text columns
+    text_cols = df.select_dtypes(include=["object", "string"]).columns
+    for c in text_cols:
+        df[c] = df[c].astype("string").str.strip()
+
+    # 5. Missing values.
+    #    NaN in the cancellation / incomplete / payment / rating columns is
+    #    *structural* ("not applicable" for that booking status), so we do NOT
+    #    impute numbers.  We keep them as NULL so AVG()/COUNT() ignore them,
+    #    and only add readable labels for the reason columns.
+    df["Canceled_Rides_by_Customer"] = df["Canceled_Rides_by_Customer"].fillna("Not Applicable")
+    df["Canceled_Rides_by_Driver"] = df["Canceled_Rides_by_Driver"].fillna("Not Applicable")
+    df["Incomplete_Rides_Reason"] = df["Incomplete_Rides_Reason"].fillna("Not Applicable")
+    df["Incomplete_Rides"] = df["Incomplete_Rides"].fillna("Not Applicable")
+    df["Payment_Method"] = df["Payment_Method"].fillna("Not Applicable")
+
+    # 6. Numeric types
+    for c in ["V_TAT", "C_TAT", "Driver_Ratings", "Customer_Rating"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["Booking_Value"] = pd.to_numeric(df["Booking_Value"], errors="coerce")
+    df["Ride_Distance"] = pd.to_numeric(df["Ride_Distance"], errors="coerce")
+
+    # 7. Derived features
+    df["Is_Success"] = (df["Booking_Status"] == "Success").astype(int)
+    df["Is_Cancelled"] = df["Booking_Status"].str.startswith("Canceled").astype(int)
+    df["Revenue"] = np.where(df["Is_Success"] == 1, df["Booking_Value"], 0)
+    df["Price_per_Km"] = np.where(
+        df["Ride_Distance"] > 0, df["Booking_Value"] / df["Ride_Distance"], np.nan
+    ).round(2)
+
+    # 8. Sanity checks (anomaly detection for the 'fraud / anomaly' use case)
+    assert df["Booking_ID"].is_unique
+    assert df["Driver_Ratings"].dropna().between(1, 5).all()
+    assert df["Customer_Rating"].dropna().between(1, 5).all()
+    assert (df["Booking_Value"] >= 0).all()
+
+    return df.sort_values(["Date", "Time"]).reset_index(drop=True)
+
 
 
 # --------------------------------------------------------------------------
 # Data layer
 # --------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading data ...")
+@st.cache_data(show_spinner="Loading data (first run can take ~1 minute) ...")
 def load_data() -> pd.DataFrame:
-    if not CSV_PATH.exists():
-        st.error(
-            f"`{CSV_PATH}` not found. Run `python 01_data_cleaning.py` first "
-            "(it needs data/OLA_DataSet.xlsx)."
-        )
-        st.stop()
-    return pd.read_csv(CSV_PATH, parse_dates=["Date"])
+    """Use a cleaned CSV if present anywhere in the repo, else clean OLA_DataSet.xlsx."""
+    for p in sorted(BASE_DIR.rglob("ola_cleaned.csv*")):
+        if p.is_file():
+            return pd.read_csv(p, parse_dates=["Date"])
+    for p in sorted(BASE_DIR.rglob("OLA_DataSet.xlsx")):
+        if p.is_file():
+            return clean(pd.read_excel(p, sheet_name="July"))
+    st.error(
+        "Data file not found. Upload `OLA_DataSet.xlsx` to your GitHub repo "
+        f"(next to app.py). Files in repo root: {sorted(x.name for x in BASE_DIR.iterdir())}"
+    )
+    st.stop()
 
 
 @st.cache_resource(show_spinner="Building SQL database ...")
@@ -52,18 +164,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def parse_sql_file() -> dict:
-    """Split 02_sql_queries.sql into {title: query}."""
-    queries, title, buf = {}, None, []
-    for line in SQL_FILE.read_text(encoding="utf-8").splitlines():
-        if line.startswith("-- Q"):
-            if title and buf:
-                queries[title] = "\n".join(buf).strip().rstrip(";")
-            title, buf = line[3:].strip(), []
-        elif title and not line.startswith("-- ===") and line.strip():
-            buf.append(line)
-    if title and buf:
-        queries[title] = "\n".join(buf).strip().rstrip(";")
-    return queries
+    return QUERIES
 
 
 df_all = load_data()
