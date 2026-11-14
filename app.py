@@ -21,7 +21,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Ola Ride Insights", page_icon="🚖", layout="wide")
 
 BASE_DIR = Path(__file__).parent
-CSV_PATH = BASE_DIR / "data" / "ola_cleaned.csv"
+DATA_DIR = BASE_DIR / "data"
 SQL_FILE = BASE_DIR / "02_sql_queries.sql"
 YELLOW, BLACK = "#C6D600", "#111111"
 PALETTE = px.colors.qualitative.Safe
@@ -32,13 +32,26 @@ PALETTE = px.colors.qualitative.Safe
 # --------------------------------------------------------------------------
 @st.cache_data(show_spinner="Loading data ...")
 def load_data() -> pd.DataFrame:
-    if not CSV_PATH.exists():
-        st.error(
-            f"`{CSV_PATH}` not found. Run `python 01_data_cleaning.py` first "
-            "(it needs data/OLA_DataSet.xlsx)."
-        )
-        st.stop()
-    return pd.read_csv(CSV_PATH, parse_dates=["Date"])
+    """Load cleaned data. Tries .csv.gz, then .csv, then builds it from the raw Excel."""
+    for name in ("ola_cleaned.csv.gz", "ola_cleaned.csv"):
+        path = DATA_DIR / name
+        if path.is_file():
+            return pd.read_csv(path, parse_dates=["Date"])
+
+    raw = DATA_DIR / "OLA_DataSet.xlsx"
+    if raw.is_file():                       # last resort: clean the raw file on the fly
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cleaning", BASE_DIR / "01_data_cleaning.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.clean(mod.load_raw())
+
+    found = sorted(p.name for p in DATA_DIR.glob("*")) if DATA_DIR.exists() else "folder missing"
+    st.error(
+        f"No data file found in `{DATA_DIR}` (found: {found}). "
+        "Add `data/ola_cleaned.csv.gz` to your GitHub repo and reboot the app."
+    )
+    st.stop()
 
 
 @st.cache_resource(show_spinner="Building SQL database ...")
