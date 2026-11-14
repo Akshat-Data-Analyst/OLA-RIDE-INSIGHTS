@@ -21,7 +21,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Ola Ride Insights", page_icon="🚖", layout="wide")
 
 BASE_DIR = Path(__file__).parent
-CSV_PATH = BASE_DIR / "data" / "ola_cleaned.csv"
+CSV_PATH = BASE_DIR / "ola_cleaned.csv.gz"
 SQL_FILE = BASE_DIR / "02_sql_queries.sql"
 YELLOW, BLACK = "#C6D600", "#111111"
 PALETTE = px.colors.qualitative.Safe
