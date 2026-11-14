@@ -33,10 +33,13 @@ PALETTE = px.colors.qualitative.Safe
 @st.cache_data(show_spinner="Loading data ...")
 def load_data() -> pd.DataFrame:
     """Load cleaned data. Tries .csv.gz, then .csv, then builds it from the raw Excel."""
-    for name in ("ola_cleaned.csv.gz", "ola_cleaned.csv"):
-        path = DATA_DIR / name
-        if path.is_file():
-            return pd.read_csv(path, parse_dates=["Date"])
+    # search data/ and any sub-folders (handles wrongly nested uploads too)
+    candidates = sorted(
+        (p for p in DATA_DIR.rglob("ola_cleaned.csv*") if p.is_file()),
+        key=lambda p: p.suffix != ".gz",          # prefer the .gz file
+    )
+    if candidates:
+        return pd.read_csv(candidates[0], parse_dates=["Date"])
 
     raw = DATA_DIR / "OLA_DataSet.xlsx"
     if raw.is_file():                       # last resort: clean the raw file on the fly
@@ -46,7 +49,7 @@ def load_data() -> pd.DataFrame:
         spec.loader.exec_module(mod)
         return mod.clean(mod.load_raw())
 
-    found = sorted(p.name for p in DATA_DIR.glob("*")) if DATA_DIR.exists() else "folder missing"
+    found = sorted(str(p.relative_to(DATA_DIR)) for p in DATA_DIR.rglob("*")) if DATA_DIR.exists() else "folder missing"
     st.error(
         f"No data file found in `{DATA_DIR}` (found: {found}). "
         "Add `data/ola_cleaned.csv.gz` to your GitHub repo and reboot the app."
